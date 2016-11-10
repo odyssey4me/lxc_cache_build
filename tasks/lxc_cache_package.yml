@@ -1,0 +1,115 @@
+---
+# Copyright 2016, Rackspace US, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+- name: Ensure that cache archive directory exists
+  file:
+    path: "{{ lxc_cache_archive_path }}"
+    state: directory
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Find files in existing cache archive path
+  find:
+    paths:
+      - "{{ lxc_cache_archive_path }}/"
+  register: _existing_cache_files
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Remove existing cache files
+  file:
+    path: "{{ item.path }}"
+    state: "absent"
+  with_items: "{{ _existing_cache_files.files }}"
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Set time-based build facts
+  set_fact:
+    _lxc_cache_expiry: "{{ current_date_time.epoch | int + lxc_cache_timeout | int }}"
+    _lxc_cache_build_id: "{{ current_date_time.year }}{{ current_date_time.month }}{{ current_date_time.day }}_{{ current_date_time.hour }}:{{ current_date_time.minute }}"
+
+- name: Create config files
+  copy:
+    content: "{{ item.content }}"
+    dest: "{{ item.dest }}"
+  with_items:
+    - content: "{{ _lxc_cache_build_id }}"
+      dest: "{{ lxc_cache_archive_path }}/build_id"
+    - content: "{{ _lxc_cache_expiry }}"
+      dest: "{{ lxc_cache_archive_path }}/expiry"
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Copy default template config files
+  copy:
+    remote_src: yes
+    src: "{{ lxc_container_cache_path }}/{{ lxc_cache_map.distro }}/{{ lxc_cache_map.release }}/{{ lxc_cache_map.arch }}/default/{{ item }}"
+    dest: "{{ lxc_cache_archive_path }}/"
+  with_items:
+    - config
+    - config-user
+    - create-message
+    - excludes-user
+    - templates
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+# This is using a shell command because the ansible archive module does not
+#  provide for the options needed to properly create an LXC image archive.
+- name: Create cache rootfs archive
+  shell: |
+    tar -Opc -C /var/lib/lxc/{{ lxc_cache_name }}/rootfs/ . | \
+          {{ lxc_xz_bin }} -{{ lxc_image_compression_ratio }} -c - > rootfs.tar.xz
+  args:
+    chdir: "{{ lxc_cache_archive_path }}"
+    creates: "{{ lxc_cache_archive_path }}/rootfs.tar.xz"
+    warn: no
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+  tags:
+    - skip_ansible_lint
+
+# This is using a shell command because the ansible archive module does not
+#  provide for the options needed to properly create an LXC image archive.
+- name: Create cache meta archive
+  shell: |
+    tar --exclude *.tar.xz --exclude *.checksum \
+        -Opc -C {{ lxc_cache_archive_path }}/ . | \
+          {{ lxc_xz_bin }} -{{ lxc_image_compression_ratio }} -c - > meta.tar.xz
+  args:
+    chdir: "{{ lxc_cache_archive_path }}"
+    creates: "{{ lxc_cache_archive_path }}/meta.tar.xz"
+    warn: no
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+  tags:
+    - skip_ansible_lint
+
+- name: Create checksum for cache archives
+  shell: "sha1sum {{ item }}.tar.xz | awk '{print $1}' > {{ item }}.checksum"
+  args:
+    chdir: "{{ lxc_cache_archive_path }}"
+    creates: "{{ lxc_cache_archive_path }}/{{ item }}.checksum"
+  with_items:
+    - rootfs
+    - meta
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+# Note (odyssey4me): This is deliberately not implemented as a handler
+# due to https://github.com/ansible/ansible/issues/18411
+- name: Destroy base container
+  lxc_container:
+    name: "{{ lxc_cache_name }}"
+    state: absent
+  when: "{{ lxc_container_backing_store != 'overlayfs' }}"
+  register: container_destroy
+  retries: 3
+  delay: 10
+  until: container_destroy | success
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"

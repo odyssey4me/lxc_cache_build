@@ -1,0 +1,172 @@
+---
+# Copyright 2016, Rackspace US, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+- name: Create base containers
+  include: lxc_cache_prep_base.yml
+  vars:
+    _base_backing_store: "dir"
+    _base_variant: "default"
+
+- name: Copy pip install script from the host into the base container
+  command: "cp /opt/get-pip.py /var/lib/lxc/{{ lxc_cache_name }}/rootfs/opt/get-pip.py"
+  when: (lxc_cache_python_packages | length > 0) or (lxc_cache_python_venvs | length > 0)
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Bind mount the host pip cache into the container
+  mount:
+    name: "/var/lib/lxc/{{ lxc_cache_name }}/rootfs/root/.cache/pip"
+    src: "/root/.cache/pip"
+    opts: bind
+    fstype: none
+    state: mounted
+  when: (lxc_cache_python_packages | length > 0) or (lxc_cache_python_venvs | length > 0)
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+  retries: 3
+  delay: 5
+
+- name: Generate apt keys on the host for the cache
+  shell: apt-key exportall > /root/repo.keys
+  changed_when: False
+  when: ansible_pkg_mgr == 'apt'
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Copy files from the host into the container cache
+  shell: |
+    if [[ -e "{{ item }}" ]]; then
+      rsync -av "{{ item }}" "/var/lib/lxc/{{ lxc_cache_name }}/rootfs{{ item }}"
+    fi
+  args:
+    executable: "/bin/bash"
+  with_items: "{{ lxc_cache_map.copy_from_host }}"
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Copy files from deployment host to the container cache
+  copy:
+    src: "{{ item.src }}"
+    dest: "/var/lib/lxc/{{ lxc_cache_name }}/rootfs{{ item.dest | default(item.src) }}"
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode | default('0644') }}"
+  with_items: "{{ lxc_container_cache_files }}"
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Copy cache python package prep script
+  copy:
+    content: |
+      #!/usr/bin/env bash
+      set -e -x
+      python /opt/get-pip.py {{ lxc_cache_pip_packages | map('quote') | join (' ') }}
+      pip install {{ lxc_cache_pip_options }} {{ lxc_cache_python_packages | join(' ') }}
+    dest: "/var/lib/lxc/{{ lxc_cache_name }}/rootfs/usr/local/bin/cache-python-package-prep-commands.sh"
+    mode: "0755"
+  when: (lxc_cache_python_packages | length > 0) or (lxc_cache_python_venvs | length > 0)
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Copy cache distro package prep script
+  copy:
+    content: |
+      #!/usr/bin/env bash
+      set -e -x
+      {{ lxc_cache_map.cache_distro_package_prep_commands }}
+    dest: "/var/lib/lxc/{{ lxc_cache_name }}/rootfs/usr/local/bin/cache-distro-package-prep-commands.sh"
+    mode: "0755"
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Copy cache default network prep script
+  copy:
+    content: |
+      #!/usr/bin/env bash
+      set -e -x
+      {{ lxc_cache_map.cache_network_prep_commands }}
+    dest: "/var/lib/lxc/{{ lxc_cache_name }}/rootfs/usr/local/bin/cache-default-network-prep-commands.sh"
+    mode: "0755"
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Copy cache extra commands script
+  copy:
+    content: |
+      #!/usr/bin/env bash
+      set -e -x
+      {{ lxc_cache_map.cache_default_prep_commands }}
+      {{ lxc_cache_extra_commands }}
+    dest: "/var/lib/lxc/{{ lxc_cache_name }}/rootfs/usr/local/bin/cache-extra-prep-commands.sh"
+    mode: "0755"
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Setup the temporary DNS resolver configuration
+  shell: |
+    if [ -e /var/lib/lxc/{{ lxc_cache_name }}/rootfs/etc/resolv.conf ]; then
+      mv /var/lib/lxc/{{ lxc_cache_name }}/rootfs/etc/resolv.conf /var/lib/lxc/{{ lxc_cache_name }}/rootfs/etc/resolv.conf.org
+    fi
+    echo "nameserver {{ lxc_net_address }}" > /var/lib/lxc/{{ lxc_cache_name }}/rootfs/etc/resolv.conf
+  changed_when: false
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Execute cache distro package prep script
+  command: "chroot /var/lib/lxc/{{ lxc_cache_name }}/rootfs /usr/local/bin/cache-distro-package-prep-commands.sh"
+  changed_when: false
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+  retries: 3
+  delay: 5
+
+- name: Execute cache python package prep script
+  command: "chroot /var/lib/lxc/{{ lxc_cache_name }}/rootfs /usr/local/bin/cache-python-package-prep-commands.sh"
+  when: (lxc_cache_python_packages | length > 0) or (lxc_cache_python_venvs | length > 0)
+  changed_when: false
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+  retries: 3
+  delay: 5
+
+- name: Execute cache default network prep script
+  command: "chroot /var/lib/lxc/{{ lxc_cache_name }}/rootfs /usr/local/bin/cache-default-network-prep-commands.sh"
+  changed_when: false
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+  retries: 3
+  delay: 5
+
+- name: Execute cache extra commands script
+  command: "chroot /var/lib/lxc/{{ lxc_cache_name }}/rootfs /usr/local/bin/cache-extra-prep-commands.sh"
+  changed_when: false
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+  retries: 3
+  delay: 5
+
+- name: Prepare the python venvs
+  include: lxc_cache_prep_venv.yml
+  static: no
+  with_items: "{{ lxc_cache_python_venvs }}"
+  when: lxc_cache_python_venvs | length > 0
+
+- name: Clean up the temporary DNS resolver configuration
+  shell: |
+    if [ -e /var/lib/lxc/{{ lxc_cache_name }}/rootfs/etc/resolv.conf.org ]; then
+      mv /var/lib/lxc/{{ lxc_cache_name }}/rootfs/etc/resolv.conf.org /var/lib/lxc/{{ lxc_cache_name }}/rootfs/etc/resolv.conf
+    else
+      rm -f /var/lib/lxc/{{ lxc_cache_name }}/rootfs/etc/resolv.conf
+    fi
+  changed_when: false
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Remove bind mount of pip cache
+  mount:
+    name: "/var/lib/lxc/{{ lxc_cache_name }}/rootfs/root/.cache/pip"
+    state: absent
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Remove pip cache directory
+  file:
+    path: "/var/lib/lxc/{{ lxc_cache_name }}/rootfs/root/.cache"
+    state: absent
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"

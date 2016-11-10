@@ -1,0 +1,117 @@
+---
+# Copyright 2016, Rackspace US, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+- name: Verify that a variant has been provided to create
+  assert:
+    that: lxc_cache_variant_name is defined
+    msg: "A value must be provided for 'lxc_cache_variant_name'."
+  tags:
+    - always
+
+- name: Set required facts based on whether lxc_cache_physical_host is defined
+  set_fact:
+    lxc_cache_ansible_architecture: >-
+      {%- if lxc_cache_physical_host is defined %}
+      {%- set _arch = hostvars[lxc_cache_physical_host]['ansible_architecture'] %}
+      {%- else %}
+      {%- set _arch = ansible_architecture %}
+      {%- endif %}
+      {{- _arch }}
+    lxc_cache_ansible_distribution: >-
+      {%- if lxc_cache_physical_host is defined %}
+      {%- set _distro = hostvars[lxc_cache_physical_host]['ansible_distribution'] %}
+      {%- else %}
+      {%- set _distro = ansible_distribution %}
+      {%- endif %}
+      {{- _distro | lower }}
+    cache_ansible_distribution_major_version: >-
+      {%- if lxc_cache_physical_host is defined %}
+      {%- set _distro_ver = hostvars[lxc_cache_physical_host]['ansible_distribution_major_version'] %}
+      {%- else %}
+      {%- set _distro_ver = ansible_distribution_major_version %}
+      {%- endif %}
+      {{- _distro_ver }}
+    lxc_cache_ansible_distribution_release: >-
+      {%- if lxc_cache_physical_host is defined %}
+      {%- set _distro_rel = hostvars[lxc_cache_physical_host]['ansible_distribution_release'] %}
+      {%- else %}
+      {%- set _distro_rel = ansible_distribution_release %}
+      {%- endif %}
+      {{- _distro_rel }}
+    lxc_cache_ansible_os_family: >-
+      {%- if lxc_cache_physical_host is defined %}
+      {%- set _distro_fam = hostvars[lxc_cache_physical_host]['ansible_os_family'] %}
+      {%- else %}
+      {%- set _distro_fam = ansible_os_family %}
+      {%- endif %}
+      {{- _distro_fam }}
+    current_date_time: >-
+      {%- if lxc_cache_physical_host is defined %}
+      {%- set _datetime = hostvars[lxc_cache_physical_host]['ansible_date_time'] %}
+      {%- else %}
+      {%- set _datetime = ansible_date_time %}
+      {%- endif %}
+      {{- _datetime }}
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+  tags:
+    - always
+
+- name: Include common vars
+  include_vars: common.yml
+  tags:
+    - always
+
+- name: Gather variables for each operating system
+  include_vars: "{{ item }}"
+  with_first_found:
+    - "{{ lxc_cache_ansible_distribution }}.yml"
+    - "{{ lxc_cache_ansible_os_family }}.yml"
+  tags:
+    - always
+
+- name: Read existing cache expiry
+  slurp:
+    src: "{{ lxc_cache_archive_path }}/expiry"
+  register: _existing_cache_expiry
+  failed_when: false
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Set fact to (re)build cache if it has expired or does not exist
+  set_fact:
+    lxc_cache_rebuild: yes
+  when: >
+      (_existing_cache_expiry.content is not defined) or
+      (not lxc_cache_rebuild and
+       _existing_cache_expiry.content is defined and
+       current_date_time['epoch'] | int >= (_existing_cache_expiry.content | b64decode) | int)
+  delegate_to: "{{ lxc_cache_physical_host | default(omit) }}"
+
+- name: Include cache preparation tasks
+  include: lxc_cache_prep.yml
+  static: no
+  when: lxc_cache_rebuild | bool
+
+- name: Include cache packaging tasks
+  include: lxc_cache_package.yml
+  static: no
+  when: lxc_cache_rebuild | bool
+
+- name: Create base container to use for copy-on-write containers
+  include: lxc_cache_prep_cow.yml
+  static: no
+  when:
+    - (lxc_container_backing_store == 'overlayfs' or
+       (lxc_container_backing_store == 'lvm' and
+        lxc_container_backing_method == 'copy-on-write'))
